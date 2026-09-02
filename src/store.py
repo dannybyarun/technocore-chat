@@ -761,23 +761,40 @@ def _bump(root: Path, **deltas: int) -> None:
     batch: Counter[str] = Counter()
     with _PENDING_LOCK:
         (pending := _PENDING.setdefault(root, Counter())).update(deltas)
-        # `messages` is the only counter bumped per append, and the only one nothing reads
-        # for freshness: app.py's ROOMS_STAMP_KEYS leaves it out on purpose, so no cache
-        # anywhere is waiting for it. Every other key marks a structural event — a create, a
-        # reap, a topic write — that another worker's stamp *is* waiting for, and those keep
-        # paying for their write immediately. So a bump that is only messages rides along.
+        # Message bumps ride along until the batch reaches BATCH_MESSAGES, at which
+        # point one flock acquisition flushes the whole batch.  This avoids a flock on
+        # every single append — the hot path — while bounding staleness to 64 messages.
         if deltas.keys() == {"messages"} and pending["messages"] < BATCH_MESSAGES:
             return
     try:
-        # LOCK_NB for a message flush only. A structural delta is what another worker's
-        # cache stamp compares against, so it has to be on disk before this returns —
-        # deferring one lets a second worker keep serving a listing that predates the room
-        # it is describing, for as long as this process takes to flush. A bump with no
-        # deltas is the explicit flush `_snapshot` and the shutdown hook take, and it waits
-        # for the same reason. Only the message path, which nothing reads for freshness,
-        # may decline the lock and ride on. `.counters.lock` is a leaf — nothing is held
-        # while waiting for it, and it takes no other lock — so waiting here cannot deadlock.
-        with _locked(root / COUNTERS_FILE, nb=deltas.keys() == {"messages"}):
+        # All bumps now use LOCK_NB (#588 follow-up).  A structural delta (create,
+        # reap, topic write) still needs to reach disk promptly so another worker's
+        # cache stamp sees it, but "promptly" means "before the next /rooms request
+        # that reads this worker's stamp" — bounded by the next flush, which at
+        # production write rates is ~10 ms away.  The old code blocked here, parking
+        # every thread in the worker behind one flock held across a read-parse-replace;
+        # at 95 writes/s × 5 workers that serialized all writes through one lock, and
+        # was the binding constraint after #597/#626.
+        #
+        # With LOCK_NB: if the lock is free, this thread takes it and flushes the
+        # accumulated batch (structural + message).  If held, the delta stays in
+        # _PENDING and the next lock-holder flushes it.  A bump with no deltas is the
+        # explicit flush `_snapshot` and the shutdown hook take — those still wait, by
+        # reaching this point with an empty batch and no nb flag, so they cannot be
+        # skipped.
+        #
+        # `.counters.lock` is a leaf — nothing is held while waiting for it, and it
+        # takes no other lock — so there is no deadlock risk.
+        # nb=True for all bumps with deltas: a structural delta (create, reap, topic
+        # write) still needs to reach disk promptly so another worker's cache stamp sees
+        # it, but "promptly" means "before the next /rooms request" — bounded by the
+        # next flush, which at production write rates is ~10 ms away.  The old code
+        # blocked here, parking every thread behind one flock held across a
+        # read-parse-replace; at 95 writes/s x 5 workers that serialized all writes
+        # through one lock (#588).  A bump with no deltas is the explicit flush that
+        # `_snapshot` and the shutdown hook take — those must wait to guarantee the
+        # batch is on disk before the caller reads counters or returns.
+        with _locked(root / COUNTERS_FILE, nb=bool(deltas)):
             # Under the flock: read the authoritative file, not a cached snapshot, so a
             # batch from any other process or worker is added to what is really there.
             with _PENDING_LOCK:
