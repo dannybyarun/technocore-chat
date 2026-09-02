@@ -725,6 +725,11 @@ _PENDING_LOCK = threading.Lock()
 # here, since it only bumps on a pass that actually reaped something.
 BATCH_MESSAGES = 64
 
+# Per-room write-path cache: avoids re-reading last_seq and last nonce from the file
+# on every append.  Initialized lazily on first write to each room, lost on restart
+# (re-read from the file).  Protected by the per-room lock — no separate lock needed.
+_ROOM_CACHE: dict[str, dict] = {}
+
 
 def _bump(root: Path, **deltas: int) -> None:
     """Add to the lifetime counters, atomically.
@@ -2354,6 +2359,24 @@ def _write_record(
         # Under the lock, before the write: two concurrent first-writers must not both
         # decide they created the room and announce it twice.
         created = not path.exists()
+        # Invalidate cache on create/recreate or when the file is larger than the
+        # cached size (another worker may have written since our last append, or the
+        # room was migrated from a flat layout).  The size check is one stat, cheaper
+        # than the two reverse_lines reads it replaces.
+        rc = _ROOM_CACHE.get(room)
+        if created or rc is None:
+            _ROOM_CACHE.pop(room, None)
+            rc = None
+        if rc is not None:
+            try:
+                cur_size = path.stat().st_size
+            except OSError:
+                cur_size = 0
+            if cur_size != rc.get("file_size", -1):
+                rc = None
+        if rc is None:
+            rc = {"last_seq": last_seq(root, room), "file_size": path.stat().st_size if path.exists() else 0}
+            _ROOM_CACHE[room] = rc
         # Also under the lock, or two concurrent replays of one captured URL would both
         # read the same "last nonce" and both write.
         if did is not None:
@@ -2366,13 +2389,18 @@ def _write_record(
                     "a signed write must carry a nonce: it is what makes a captured "
                     "signed URL single-use. Send 1-19 digits, counting up per key per room"
                 )
+            # Nonce validation is NOT cached: _last_nonce scans a bounded tail of
+            # the room file, and the protocol permits replay once newer traffic buries
+            # the original past that tail (tested by
+            # test_a_replay_is_accepted_once_traffic_buries_the_record_past_the_scan_tail).
+            # Caching would break that invariant.
             previous = _last_nonce(root, room, did)
             if previous is not None and nonce <= previous:
                 raise StoreError(
                     f"nonce {nonce} is not greater than {previous}, the last one this key "
                     f"used in /r/{room} — a signed URL is single-use, so count up"
                 )
-        rec["seq"] = last_seq(root, room) + 1
+        rec["seq"] = rc["last_seq"] + 1
         line = orjson.dumps(rec) + b"\n"
         # Heal a torn tail before appending. A write cut short by a crash leaves a record
         # with no trailing newline; appending straight onto it would fuse the two into one
@@ -2400,6 +2428,9 @@ def _write_record(
         # `line` gained a leading newline — so this is exact, not an estimate.
         if size + len(line) > limit:
             _compact(path, cutoff=_cutoff(room), keep=limit // 2)
+        # Update the write-path cache: the seq just written is now the room's head.
+        rc["last_seq"] = rec["seq"]
+        rc["file_size"] = size + len(line)
     if created:
         # Bump the room's generation: a (re)created room is a new conversation, and the read
         # view exposes the old generation's number so a stateful client can detect the
