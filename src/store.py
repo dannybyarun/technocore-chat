@@ -2378,13 +2378,18 @@ def _write_record(
         # with no trailing newline; appending straight onto it would fuse the two into one
         # unparseable line, so the *next* message would be lost too — the torn record must
         # cost only itself.
-        size = path.stat().st_size if path.exists() else 0
-        if size:
-            with path.open("rb") as f:
+        #
+        # Single open for tear-check + append: avoids a separate stat() + rb open,
+        # eliminating one syscall and a TOCTOU window where another thread could write
+        # between the stat and the open. `a+b` creates the file if it does not exist yet,
+        # so the new-room path (size == 0) skips the tear check naturally.
+        with path.open("a+b") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            if size:
                 f.seek(size - 1)
                 if f.read(1) != b"\n":
                     line = b"\n" + line
-        with path.open("ab") as f:
             f.write(line)
             f.flush()
             if config.FSYNC:  # see the knob: the one durability trade an operator may make
