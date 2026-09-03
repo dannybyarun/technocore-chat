@@ -728,7 +728,7 @@ BATCH_MESSAGES = 64
 # Per-room write-path cache: avoids re-reading last_seq and last nonce from the file
 # on every append.  Initialized lazily on first write to each room, lost on restart
 # (re-read from the file).  Protected by the per-room lock — no separate lock needed.
-_ROOM_CACHE: dict[str, dict] = {}
+_ROOM_CACHE: dict[tuple[Path, str], dict] = {}
 
 
 def _bump(root: Path, **deltas: int) -> None:
@@ -772,34 +772,16 @@ def _bump(root: Path, **deltas: int) -> None:
         if deltas.keys() == {"messages"} and pending["messages"] < BATCH_MESSAGES:
             return
     try:
-        # All bumps now use LOCK_NB (#588 follow-up).  A structural delta (create,
-        # reap, topic write) still needs to reach disk promptly so another worker's
-        # cache stamp sees it, but "promptly" means "before the next /rooms request
-        # that reads this worker's stamp" — bounded by the next flush, which at
-        # production write rates is ~10 ms away.  The old code blocked here, parking
-        # every thread in the worker behind one flock held across a read-parse-replace;
-        # at 95 writes/s × 5 workers that serialized all writes through one lock, and
-        # was the binding constraint after #597/#626.
-        #
-        # With LOCK_NB: if the lock is free, this thread takes it and flushes the
-        # accumulated batch (structural + message).  If held, the delta stays in
-        # _PENDING and the next lock-holder flushes it.  A bump with no deltas is the
-        # explicit flush `_snapshot` and the shutdown hook take — those still wait, by
-        # reaching this point with an empty batch and no nb flag, so they cannot be
-        # skipped.
+        # Hot-path counters (`messages`, `notes_written`) use LOCK_NB so that note
+        # writes and message batches never serialize through the flock (#588).
+        # Structural deltas (rooms_created, reaped_*, topics_written) block to
+        # preserve cross-worker stamp ordering for /rooms.
         #
         # `.counters.lock` is a leaf — nothing is held while waiting for it, and it
         # takes no other lock — so there is no deadlock risk.
-        # nb=True for all bumps with deltas: a structural delta (create, reap, topic
-        # write) still needs to reach disk promptly so another worker's cache stamp sees
-        # it, but "promptly" means "before the next /rooms request" — bounded by the
-        # next flush, which at production write rates is ~10 ms away.  The old code
-        # blocked here, parking every thread behind one flock held across a
-        # read-parse-replace; at 95 writes/s x 5 workers that serialized all writes
-        # through one lock (#588).  A bump with no deltas is the explicit flush that
-        # `_snapshot` and the shutdown hook take — those must wait to guarantee the
-        # batch is on disk before the caller reads counters or returns.
-        with _locked(root / COUNTERS_FILE, nb=bool(deltas)):
+        _HOT_PATH_KEYS = {"messages", "notes_written"}
+        _has_structural = bool(set(deltas) - _HOT_PATH_KEYS) if deltas else False
+        with _locked(root / COUNTERS_FILE, nb=bool(deltas) and not _has_structural):
             # Under the flock: read the authoritative file, not a cached snapshot, so a
             # batch from any other process or worker is added to what is really there.
             with _PENDING_LOCK:
@@ -1704,6 +1686,7 @@ def _reap(root: Path) -> None:
                             room = p.name[: -len(".jsonl")]
                             _set_seq_entry(root, room, max(0, last_seq(root, room)))
                         p.unlink(missing_ok=True)
+                        _ROOM_CACHE.pop((root, p.stem), None)
                         config._dbg(2, "reap", room=p.name, reason=reason)
                         if stillborn_rule:
                             reaped[f"reaped_{reason}"] += 1
@@ -2363,9 +2346,10 @@ def _write_record(
         # cached size (another worker may have written since our last append, or the
         # room was migrated from a flat layout).  The size check is one stat, cheaper
         # than the two reverse_lines reads it replaces.
-        rc = _ROOM_CACHE.get(room)
+        _cache_key = (root, room)
+        rc = _ROOM_CACHE.get(_cache_key)
         if created or rc is None:
-            _ROOM_CACHE.pop(room, None)
+            _ROOM_CACHE.pop(_cache_key, None)
             rc = None
         if rc is not None:
             try:
@@ -2376,7 +2360,7 @@ def _write_record(
                 rc = None
         if rc is None:
             rc = {"last_seq": last_seq(root, room), "file_size": path.stat().st_size if path.exists() else 0}
-            _ROOM_CACHE[room] = rc
+            _ROOM_CACHE[_cache_key] = rc
         # Also under the lock, or two concurrent replays of one captured URL would both
         # read the same "last nonce" and both write.
         if did is not None:
@@ -2428,9 +2412,14 @@ def _write_record(
         # `line` gained a leading newline — so this is exact, not an estimate.
         if size + len(line) > limit:
             _compact(path, cutoff=_cutoff(room), keep=limit // 2)
-        # Update the write-path cache: the seq just written is now the room's head.
-        rc["last_seq"] = rec["seq"]
-        rc["file_size"] = size + len(line)
+            # Compact rewrites the file; the cached file_size no longer matches.
+            # Invalidate so the next write re-reads last_seq from the new file.
+            _ROOM_CACHE.pop(_cache_key, None)
+            rc = None
+        if rc is not None:
+            # Update the write-path cache: the seq just written is now the room's head.
+            rc["last_seq"] = rec["seq"]
+            rc["file_size"] = size + len(line)
     if created:
         # Bump the room's generation: a (re)created room is a new conversation, and the read
         # view exposes the old generation's number so a stateful client can detect the

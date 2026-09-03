@@ -7,13 +7,14 @@ therefore serialised writes to every *other* room behind it, on a file neither o
 
 Two rules replace it. A bump whose only delta is `messages` rides in a process-local bucket
 instead of paying for a write at all — that is the one counter bumped on every append, and the
-one nothing reads for freshness (`app.py`'s ROOMS_STAMP_KEYS leaves it out on purpose). Every
-other key marks a structural event another worker's cache stamp is waiting for, so those still
-write immediately; and when they cannot get the lock, `LOCK_NB` means they leave their delta
-in the same bucket rather than queueing. Four things have to hold, and only the first is about
-speed:
+one nothing reads for freshness (`app.py`'s ROOMS_STAMP_KEYS leaves it out on purpose). A
+bump whose only delta is `notes_written` also uses LOCK_NB, because that is the hot-path
+counter (#588) and the staleness bound (note_stats TTL) tolerates a brief delay. Every other
+key marks a structural event another worker's cache stamp is waiting for, so those still
+write immediately and block on the flock to guarantee cross-worker stamp ordering. Four
+things have to hold, and only the first is about speed:
 
-- a bump never waits on that lock, whoever is holding it;
+- a message-only or notes-only bump never waits on that lock, whoever is holding it;
 - nothing is lost or counted twice on the way through the bucket — not under concurrent
   threads, and not when a replace fails after the batch has been taken out of it;
 - a structural bump still persists immediately, and a riding message is bounded — by the
@@ -42,8 +43,10 @@ def _clean_pending():
     import store
 
     store._PENDING.clear()
+    store._ROOM_CACHE.clear()
     yield
     store._PENDING.clear()
+    store._ROOM_CACHE.clear()
 
 
 def _persisted(root: Path) -> dict:
@@ -244,47 +247,37 @@ def test_a_message_flush_does_not_wait_for_a_held_lock(tmp_path) -> None:
     assert store._PENDING[tmp_path] == {"messages": store.BATCH_MESSAGES}, "deltas were dropped"
 
 
-def test_a_structural_bump_defers_when_lock_is_held_and_flushes_on_next_bump(
-    tmp_path,
-) -> None:
-    """Structural bumps now use LOCK_NB like message bumps (#588 follow-up).
+def test_a_structural_bump_waits_for_the_lock_rather_than_deferring(tmp_path) -> None:
+    """A create, a reap and a topic write are what `_rooms_stamp` compares to decide whether
+    another worker's listing is stale, so those must be on disk when the bump returns —
+    batching them would make a second worker's new room invisible for a cache window, for
+    reasons no reader could see.
 
-    A structural counter is what another worker compares to decide its cached listing is
-    stale.  The old code blocked here, parking every thread behind one flock held across a
-    read-parse-replace; at 95 writes/s x 5 workers that serialized all writes through one
-    lock.  With LOCK_NB, a structural bump that finds the lock held leaves its delta in
-    _PENDING and returns — the next lock-holder flushes the batch.  Staleness is bounded by
-    the next flush, which at production write rates is ~10 ms (one append interval).
-
-    This test verifies: (1) the structural bump does NOT block when the lock is held, and
-    (2) the delta IS persisted when the lock becomes free and a flush runs.
+    Only `notes_written` (the hot-path counter) is allowed to ride in the bucket without
+    waiting for the lock (#588).  Structural deltas block to preserve cross-worker stamp
+    ordering.
     """
     import store
 
     done = threading.Event()
+    result = [None]
 
     def bump() -> None:
         store._bump(tmp_path, rooms_created=1)
+        result[0] = "done"
         done.set()
 
     with _lock_held(tmp_path):
         writer = threading.Thread(target=bump, daemon=True)
         writer.start()
-        # With LOCK_NB, the structural bump should complete quickly (not block)
-        # even though the lock is held.
-        assert done.wait(2.0), "structural bump should not block on the lock"
-        # The delta should be in _PENDING, not yet on disk
-        assert tmp_path in store._PENDING
-        assert store._PENDING[tmp_path]["rooms_created"] == 1
-        assert not (tmp_path / store.COUNTERS_FILE).exists()
+        assert not done.wait(2.0), "structural bump must block on a held lock"
+        assert result[0] is None, "bump should not have returned yet"
+        assert not (tmp_path / store.COUNTERS_FILE).exists(), "it did not write under another holder"
 
-    # After the lock is released, the delta is still pending until a flush runs
-    assert tmp_path in store._PENDING
-
-    # Now flush by calling _bump with no deltas (explicit flush)
-    store._bump(tmp_path)
-    assert _persisted(tmp_path)["rooms_created"] == 1
-    assert tmp_path not in store._PENDING
+    writer.join(timeout=10)
+    assert done.is_set(), "bump did not finish after the lock was released"
+    assert _persisted(tmp_path)["rooms_created"] == 1, "it persisted on disk before returning"
+    assert tmp_path not in store._PENDING, "nothing may be left pending when nothing contended"
 
 
 def test_deltas_accumulate_while_the_lock_is_held(tmp_path) -> None:
