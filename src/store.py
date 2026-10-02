@@ -48,6 +48,12 @@ MAX_ROOM_BYTES = 10 << 20  # 10 MiB per room, then compacted
 # COMPACT_KEEP_BYTES // 64, spelled against MAX_ROOM_BYTES so it stays one statement.
 COMPACT_KEEP_BYTES, COMPACT_MAX_LINES = MAX_ROOM_BYTES // 2, MAX_ROOM_BYTES // 128
 READ_BUDGET = 1 << 20  # never read more than 1 MiB to answer a tail request
+# The replay guard's window is MAX_ROOM_BYTES, named at the call rather than here, and it is
+# deliberately NOT the reader's. A captured signed URL is replayable exactly as long as its
+# record is retained, so the guard has to reach as far back as retention keeps — sharing
+# READ_BUDGET left a 10 MiB room replaying a nonce whose record was still on disk (#466).
+# Naming it at the call site is the point: equalling a reader's budget is what made the old
+# bound wrong, and a shared default is exactly what makes that equality hard to see.
 # The ceiling a caller may ask for, and the window they get if they ask for nothing. One
 # statement because they are one decision about one parameter — and named, rather than
 # literals at each call site, because the manual states both. A default written into prose
@@ -2572,7 +2578,7 @@ def _log_event(root: Path, line: str) -> None:
 
 
 def _last_nonce(root: Path, room: str, did: str) -> int | None:
-    """The newest nonce this DID used in this room, within the tail READ_BUDGET covers.
+    """The newest nonce this DID used in this room, within the retained ring.
 
     Bounded on purpose. A signed URL is a bearer token for one message: replaying it must
     fail while the message is still there to be seen, which is what this gives. Once the
@@ -2580,6 +2586,26 @@ def _last_nonce(root: Path, room: str, did: str) -> int | None:
     accepted again as a fresh message. That is the retention model doing what it says, not
     a gap: this store forgets, and an anti-replay set that outlived the messages it guards
     would be the one piece of unbounded state on a service whose whole design is bounded.
+
+    **The window is the whole retained ring, not the reader's tail.** This used to take
+    `reverse_lines`' default, which is READ_BUDGET (1 MiB) — while a room retains up to
+    MAX_ROOM_BYTES (10 MiB). The two being equal was the whole basis of the safety
+    argument, and it held only by coincidence: #466 showed a captured signed write
+    replaying at nonce 1 while the original record was still physically on disk, accepted
+    as a fresh visible message once ~1 MiB of someone else's traffic buried it. Retention
+    is the boundary that matters — a record the room still holds is a record an attacker
+    can still fetch, so the guard has to reach at least as far back as retention keeps.
+
+    Wider than a reader needs, which is the safe direction: a MAX_LIMIT tail can run out of
+    records before it runs out of budget, and the guard reaching past what is visible costs
+    nothing and hides nothing. It stops at the ring because past the ring the record is
+    genuinely gone, and an anti-replay set outliving the messages it guards would be the one
+    piece of unbounded state on a service whose whole design is bounded.
+
+    Cost, measured rather than assumed: the scan is newest-first and returns on the first
+    line carrying the DID, so an active writer pays ~0.04 ms either way. Only a DID absent
+    from the file scans the whole budget — 3.4 ms -> 21 ms on a 6 MiB room — and that is a
+    write that is about to be accepted anyway.
     """
     path = room_path(root, room)
     if not path.exists():
@@ -2597,7 +2623,7 @@ def _last_nonce(root: Path, room: str, did: str) -> int | None:
     # what this buys — to cover files this store did not write, so it stays out of the loop.
     did_b = did.encode()
     with path.open("rb") as f:
-        for raw in reverse_lines(f):
+        for raw in reverse_lines(f, max_bytes=MAX_ROOM_BYTES):  # not READ_BUDGET: see above
             if did_b not in raw:
                 continue
             rec = _parse(raw)

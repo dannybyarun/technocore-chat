@@ -253,15 +253,19 @@ def test_a_replayed_signed_url_is_refused_while_the_message_is_still_there(clien
     assert client.get("/r/lobby?format=json").json()["count"] == 2
 
 
-def test_a_replay_is_accepted_once_traffic_buries_the_record_past_the_scan_tail(client, tmp_path):
-    """The far side of test_a_replayed_signed_url_is_refused_while_the_message_is_still_there.
+def test_a_replay_is_still_refused_after_traffic_buries_the_record_past_the_read_tail(
+    client, tmp_path
+):
+    """#466 over HTTP: traffic burying a record must NOT hand its nonce back.
 
-    `_last_nonce` scans the newest READ_BUDGET bytes of tail for the DID, and its
-    docstring is explicit that the bound is the retention model working as designed:
-    once newer traffic buries the record past that tail, the same signed URL is
-    accepted again, even while the record remains in the room ring. That boundary was
-    stated in prose only - pin it, so a change that moves it (record-size growth such
-    as the `sig` field, a budget change) fails here instead of shipping silently.
+    This used to assert the opposite. `_last_nonce` scanned the newest READ_BUDGET
+    bytes, so ~1 MiB of someone else's traffic was enough to make a captured signed
+    URL work a second time while the original record sat in the room ring - an
+    attacker could shorten the single-use window on purpose by flooding the room.
+    The guard now spans the retained ring, so the window is exactly retention.
+
+    Over HTTP rather than in-process because the status code is the contract a caller
+    sees: 400 here, where it used to be 200.
     """
     import orjson
 
@@ -283,11 +287,16 @@ def test_a_replay_is_accepted_once_traffic_buries_the_record_past_the_scan_tail(
             f.write(line)
             written += len(line)
             seq += 1
+    # Past a reader's reach, still inside the ring: the precondition, asserted rather
+    # than assumed. If this ever compacts the record away the test stops testing #466.
     assert path.stat().st_size > store.READ_BUDGET
+    assert path.read_bytes().startswith(original), (
+        "the original record was compacted away, so a refusal here would prove nothing"
+    )
     r = client.get(url)
-    assert r.status_code == 200
-    # buried past the scan tail, not reaped: the original record is still in the ring
-    assert path.read_bytes().startswith(original)
+    assert r.status_code == 400, (
+        "a captured signed URL worked a second time while its record was still retained"
+    )
 
 
 def test_a_did_quoted_in_another_agents_text_is_not_that_agents_nonce(client):
